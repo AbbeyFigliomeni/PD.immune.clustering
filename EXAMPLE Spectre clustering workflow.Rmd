@@ -1,0 +1,290 @@
+---
+title: "20240817 MAIT characterisation MAIT clustering for thesis"
+author: "Abbey Figliomeni"
+date: "2024-08-17"
+output: html_document
+---
+
+# Data import and preprocessing
+## Extract flow data (class: gatingset) using cytoML
+```{r, results="hide"}
+source("[cytoML script]")
+```
+
+## Libraries
+```{r, results='hide', message=FALSE}
+library(Spectre)
+Spectre::package.check()    # Check that all required packages are installed
+Spectre::package.load()  
+```
+
+## Convert gatingset object to cytoset
+Cytoset object extracted from gatingset, then subsetted using flowJo "MAIT cell" gate.
+```{r}
+cs <- gs_pop_get_data(gs, "MAIT cells")
+cs  # returns a cytoset with only cells contained within MAIT 
+```
+
+## Add meta data, convert to data.table, and merge files into list
+```{r}
+### create list of converted data.tables with phenodata
+data.list <- list()  # creates empty list for data.tables
+pDatalist <- colnames(pData(cs))  # column names from cs phenodata as a list
+
+
+### convert and append cytoframes 
+for(s in 1:length(sampleNames(cs))){
+  a <- exprs(cs[[s]])  # get extract flowframe data as matrix
+  b <- as.data.frame(a)  #convert flowframe data to dataframe
+  col_change_vec <- grep("Comp", colnames(cs[[s]]))  #creates numerical vector with which colnames contain "comp" (ie not FSC SSC Time)
+  y <- keyword(cs[[s]])  # extract keywords from flowframe (column numbers 'n' in flowframe correspond to $Pn, parameter names under $PnS)
+  for(n in col_change_vec){
+    colnames(b)[[n]] <- y[[paste("$P", n, "S", sep="")]]  # finds matching keyword for columns containing comp parameters
+  }
+  b$`FSC-A` <- NULL
+  b$`FSC-H` <- NULL
+  b$`FSC-W` <- NULL
+  b$`SSC-A` <- NULL # delete irrelevant parameters (could do this with vector instead of one at a time)
+  b$`SSC-H` <- NULL
+  b$`SSC-W` <- NULL
+  b$Time <- NULL
+  b$ID <- sampleNames(cs[s])  #creates ID column corresponding to FLOWSET-EMBEDDED sample name (extra check rather than relying on pData)
+  b$FileNo <- s  # file number according to flowframe index in flowset
+  x <- pData(cs[s])  # extract flowset phenodata for sample n
+  for(p in pDatalist){
+    b[[p]] <- x[[p]]  # appends matching pData columns to flowframe dataframe
+  }
+  b <- as.data.table(b)  # converts dataframe to data.table
+  data.list[[s]] <- b  # appends data.table to list, in order
+}
+
+
+```
+
+## Check data
+```{r}
+## Data check
+check <- do.list.summary(data.list)
+check$name.table # Review column names and their subsequent values
+check$ncol.check # Review number of columns (features, markers) in each sample
+check$nrow.check # Review number of rows (cells) in each sample (should be same as number of cells in lymph gate for each sample)
+data.list[[1]]  # view first and last six rows of data from first sample
+```
+
+## Data.table list to combined data.table
+```{r}
+## Data.list to Data.table ----
+cell.dat <- Spectre::do.merge.files(dat = data.list)
+cell.dat
+```
+
+# FlowSOM clustering
+## Define cluster and analysis columns
+```{r}
+as.matrix(names(cell.dat))
+cellular.cols <- names(cell.dat)[c(1, 4:7, 8:11)] #for MFI analyses, including MR1-tetramer
+as.matrix(cellular.cols)
+cluster.cols <- names(cell.dat)[c(1,4:7,9:13)]  # exclude live dead Zombie UV, CD3, MR1-tetramer
+as.matrix(cluster.cols)
+
+# exp.name <- 
+sample.col <- "ID"
+group.col <- "Condition"
+# group.col2 <- "H_and_Y"
+batch.col <- "EXPERIMENT_NAME"
+```
+
+## Run FlowSOM
+```{r}
+cell.dat <- run.flowsom(cell.dat, cluster.cols, meta.k = 5)  # meta.k specifies number of metaclusters
+cell.dat
+```
+
+# Dimensionality reduction
+## Downsampling
+```{r}
+## Set targets 
+data.frame(table(cell.dat[[group.col]])) # Check number of cells/rows in each group
+unique(cell.dat[[group.col]]) # check order groups appear in for subsequent assigning downsampling vector - in this case PD THEN control
+
+sub.targets <- c(50000, 50000) # target subsample numbers from each group
+sub.targets
+# cell.sub <- do.subsample(cell.dat, divide.by= "ID", min.per=TRUE)
+
+
+## Subsample groups by sub.targets
+cell.sub <- do.subsample(cell.dat, sub.targets, group.col, seed=17)
+cell.sub
+```
+
+## UMAP 
+```{r}
+cell.sub <- run.umap(cell.sub, cluster.cols)  # run DR (UMAP) on subsample using cluster.cols
+cell.sub
+```
+
+
+# Cluster annotation
+## Make plots to inform cluster annotation
+```{r, warning=FALSE}
+setwd("[working directory]")
+
+# UMAP by cluster
+make.colour.plot(cell.sub, "UMAP_X", "UMAP_Y", "FlowSOM_metacluster", col.type = 'factor',
+                add.label=T, title = "Scaled parameters 300k cells")  # labels UMAP by cluster ID
+# UMAP by marker density
+make.multi.plot(cell.sub, "UMAP_X", "UMAP_Y", plot.by = cluster.cols, figure.title = "Marker Expression")  # plots individual UMAPs with overlaid marker expression (all markers, not just those used to cluster)
+
+# cluster heatmap
+exp <- do.aggregate(cell.dat, cluster.cols, by = "FlowSOM_metacluster")
+make.pheatmap(exp, "FlowSOM_metacluster", cluster.cols, plot.title="Heatmap no annotation")
+```
+
+## Define annotations for MAIT
+```{r}
+annots <- list("CD4 SP MAIT"=1,
+               "canonical MAIT"=2,
+               "T-bet hi"=3, 
+               "MR1-reactive T cell"=4,
+               "CD45RO- MAIT"=5)
+
+annots <- do.list.switch(annots)
+names(annots) <- c("Values", "Population")
+setorderv(annots, "Values")
+annots
+
+## Add to data.table and subsetted data.table ----
+cell.dat <- do.add.cols(cell.dat, "FlowSOM_metacluster", annots, "Values")
+cell.dat
+cell.sub <- do.add.cols(cell.sub, "FlowSOM_metacluster", annots, "Values")
+cell.sub
+```
+
+
+
+# PUBLICATION QUALITY ANNOTATED FIGS
+## Batch integration check
+```{r}
+## Plot path
+setwd("[working directory]")
+
+## Batch integration check
+make.multi.plot(cell.sub, "UMAP_X", "UMAP_Y", plot.by = 'EXPERIMENT_NAME', col.type = 'factor',
+                plot.width = 20, figure.title="UMAP by Batch")  # overlays batches on single umap plot
+
+make.multi.plot(cell.sub, "UMAP_X", "UMAP_Y", "Population", divide.by = 'EXPERIMENT_NAME',
+                col.type = 'factor', plot.width = 20, figure.title="FlowSOM Metacluster by Batch")  # cluster-annotated umap plot for each batch to check presence of all clusters across batches
+
+# UMAP with overlayed labelled metaclusters
+make.colour.plot(cell.sub, "UMAP_X", "UMAP_Y", "Population", col.type = 'factor',
+                 add.label = TRUE, nudge_x = -0.5, nudge_y = -0.5,
+                 title = "", plot.height = 15, plot.width = 12,
+                 dot.size = 2, blank.axis = F, legend.loc = 'none')  # labels UMAP by cluster ID
+# no labels
+make.colour.plot(cell.sub, "UMAP_X", "UMAP_Y", "Population", col.type = 'factor',
+                 add.label = F,
+                 plot.height = 15, plot.width = 12,
+                 dot.size = 2, blank.axis = F, title="MAIT cells")  # labels UMAP by cluster ID
+
+# UMAP plots by each marker used in clustering
+make.multi.plot(cell.sub,"UMAP_X", "UMAP_Y", plot.by = cluster.cols, figure.title = "UMAP by Cluster Marker")
+
+# UMAP plots by all markers used in clustering
+make.multi.plot(cell.sub,"UMAP_X", "UMAP_Y", plot.by = cellular.cols, figure.title = "UMAP by Marker")
+
+# UMAP plot divided by condition
+make.multi.plot(cell.sub, "UMAP_X", "UMAP_Y", plot.by="Population", divide.by=group.col,
+                col.type="factor", figure.title = "UMAP by Condition", dot.size=0.3)
+
+# HEATMAP
+exp <- do.aggregate(cell.dat, use.cols = cluster.cols, by = "Population")
+make.pheatmap(dat = exp, sample.col = "Population", plot.cols = cluster.cols,
+              dendrograms = "none", standard.colours = "BuPu",
+              plot.title="")
+```
+
+
+# Summary data 
+## Generate summary data
+```{r, warning=FALSE}
+as.matrix(names(cell.dat))  # check col names
+
+## Generate summary data ----
+# calculate percent of clusters in each sample (ID), as well as MFI of markers in each cluster
+sum.dat <- create.sumtable(dat = cell.dat, # The dataset to be summarised
+                           sample.col = 'ID', # The column that denotes the sample name/ID
+                           pop.col = 'Population', # The column that denotes the population name/ID
+                           use.cols = c("MR1-5-OP-RU PE", "T-bet BV605", "EOMES PE-Cy7"), # Columns (markers) whose expression we will measure on each population in each sample
+                           annot.cols = c('Condition'), # Additional columns we would like to include for annotation purposes (e.g. group names, batch names, etc)
+)
+
+
+head(sum.dat)
+```
+
+# define inverse transform for MFIs
+## inverse transform HLA-DR MFI
+```{r}
+trans <- gh_get_transformations(gs[[1]], inverse = TRUE)
+trans
+MR1trans <- trans[["Comp-[561] 582_15-A"]]  
+Tbettrans <- trans[["Comp-[405] 610_20-A"]]
+Eomestrans <- trans[["Comp-[561] 780_60-A"]]
+
+
+MR1cols <- grep("MR1-5-OP-RU", colnames(sum.dat))
+MR1cols
+apply(sum.dat[,8:12], MARGIN = 2, MR1trans)  # check same as below
+sum.dat[,8:12] <- lapply(sum.dat[,8:12], MR1trans)  
+sum.dat[,8:12]
+
+Tbetcols <- grep("BV605", colnames(sum.dat))
+Tbetcols
+apply(sum.dat[,13:17], MARGIN = 2, Tbettrans)  # check same as below
+sum.dat[,13:17] <- lapply(sum.dat[,13:17], Tbettrans)  
+sum.dat[,13:17] 
+
+Eomescols <- grep("EOMES", colnames(sum.dat))
+Eomescols
+apply(sum.dat[,18:22], MARGIN = 2, Eomestrans)  # check same as below
+sum.dat[,18:22] <- lapply(sum.dat[,18:22], Eomestrans)  
+sum.dat[,18:22] 
+```
+
+
+
+## Convert NA population percentages into 0, edit sum.dat column names
+```{r}
+colnames(sum.dat)
+percent.cols <- grep("Percent", colnames(sum.dat))  # defining plot columns as those that contain "percent"
+for (i in percent.cols){
+  index <- is.na(sum.dat[[i]])
+  sum.dat[[i]][index] <- 0 # convert NA percentages, which based on function documentation indicate no population, to zero
+}
+
+
+colnames(sum.dat) <- gsub("Percent of sample -- ", "Percent.", colnames(sum.dat))
+colnames(sum.dat) <- gsub("MFI of MR1-5-OP-RU PE -- ", "MR1.tet.MFI.", colnames(sum.dat))
+colnames(sum.dat) <- gsub("MFI of T-bet BV605 -- ", "Tbet.MFI.", colnames(sum.dat))
+colnames(sum.dat) <- gsub("MFI of EOMES PE-Cy7 -- ", "EOMES.MFI.", colnames(sum.dat))
+colnames(sum.dat) <- gsub("CD45RO\\-", "CD45ROneg", colnames(sum.dat))
+
+colnames(sum.dat) <- gsub(" ", ".", colnames(sum.dat))
+colnames(sum.dat) <- gsub("\\-", ".", colnames(sum.dat))
+
+
+colnames(sum.dat)
+
+```
+
+
+## Save Summary Data
+```{r, warning=FALSE}
+setwd("[working directory]")
+
+PopSummaryData <- as.data.frame(sum.dat)
+colnames(PopSummaryData)
+write.csv(PopSummaryData, "MAIT_PopSummaryData.csv", row.names = F)  # entire dataframe including marker MFI on respective clusters
+```
+
+
